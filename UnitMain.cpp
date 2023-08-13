@@ -8,79 +8,23 @@
 #include <XMLDoc.hpp>
 
 #include "UnitMain.h"
+#include "tools.h"
+
 // ---------------------------------------------------------------------------
 #pragma package(smart_init)
 #pragma resource "*.dfm"
 TFormMain *FormMain;
 
+const String _configFile(tl_GetProgramPath() + Application->Title + L".xml");
 String _winTitle(L"μTorrent");
 String _winClass(L"µTorrent");
 String _exeName(L"utorrent.exe"); // lower case!
+int _startupDelay = 5000; // give time for utorrent to show its window
+int _pollInterval = 1000;
+
 bool _winFound = false;
 bool _firstTimer = true;
-
-// ---------------------------------------------------------------------------
-String tl_GetModuleName()
-{
-	wchar_t buf[MAX_PATH];
-	GetModuleFileName(NULL, buf, MAX_PATH);
-	return (String)buf;
-}
-
-// ---------------------------------------------------------------------------
-String tl_GetProgramPath() // path with trailing '\'
-{
-	static String Path = tl_GetModuleName();
-	return Path.SubString(1, Path.LastDelimiter(L"\\"));
-}
-
-// ---------------------------------------------------------------------------
-String GetWindowClassPlus(HWND hwnd)
-{
-	wchar_t *tbuf = new wchar_t[2048];
-	tbuf[0] = L'\0';
-	GetClassName(hwnd, tbuf, 2047);
-	String ret(tbuf);
-	delete[]tbuf;
-	return ret;
-}
-
-// ---------------------------------------------------------------------------
-String GetWindowTitlePlus(HWND hwnd)
-{
-	wchar_t *tbuf = new wchar_t[2048];
-	tbuf[0] = L'\0';
-	GetWindowText(hwnd, tbuf, 2047);
-	String ret(tbuf);
-	delete[]tbuf;
-	return ret;
-}
-
-DWORD PSAPI_EnumProcesses(std::list<DWORD>& listProcessIDs, DWORD dwMaxProcessCount)
-{
-	DWORD dwRet = NO_ERROR;
-	listProcessIDs.clear();
-	DWORD *pProcessIds = new DWORD[dwMaxProcessCount];
-	DWORD cb = dwMaxProcessCount*sizeof(DWORD);
-	DWORD dwBytesReturned = 0;
-
-	// call PSAPI EnumProcesses
-	if (::EnumProcesses(pProcessIds, cb, &dwBytesReturned))
-	{
-		// push returned process IDs into the output list
-		const int nSize = dwBytesReturned / sizeof(DWORD);
-		for (int nIndex = 0; nIndex < nSize; nIndex++)
-		{
-			listProcessIDs.push_back(pProcessIds[nIndex]);
-		}
-	}
-	else
-	{
-		dwRet = ::GetLastError();
-	}
-	delete[]pProcessIds;
-	return dwRet;
-}
+HANDLE _hUtProcess = NULL;
 
 // ---------------------------------------------------------------------------
 static BOOL CALLBACK enumWindowCallback(HWND hTarget, LPARAM lparam)
@@ -155,30 +99,38 @@ DWORD FindExeProcess(String exe)
 __fastcall TFormMain::TFormMain(TComponent* Owner) : TForm(Owner)
 {
 	// TrayIcon1->Visible = true;
-	// Save();
 	Load();
 
 	// start utorrent
-	String exe;
+	String runcmd, cmdline(GetCommandLineW()), args;
+	wchar_t **argv = NULL;
+	int argc = 0;
+	argv = CommandLineToArgvW(cmdline.w_str(), &argc);
+	args = cmdline.SubString(wcslen(argv[0]) + 3, cmdline.Length());
+	runcmd.printf(L"\"%s%s\"%s", tl_GetProgramPath().w_str(), _exeName.w_str(),
+		args.w_str());
+	LocalFree(argv);
+
 	STARTUPINFO si;
 	PROCESS_INFORMATION pi;
 	ZeroMemory(&si, sizeof(si));
 	si.cb = sizeof(si);
 	ZeroMemory(&pi, sizeof(pi));
-	exe.printf(L"%s%s", tl_GetProgramPath().w_str(), _exeName.w_str());
-	if (CreateProcess(exe.w_str(), NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
+	if (CreateProcess(NULL, runcmd.w_str(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
 	{
 		CloseHandle(pi.hThread);
-		CloseHandle(pi.hProcess);
+		// CloseHandle(pi.hProcess);
+		_hUtProcess = pi.hProcess;
 	}
 	else
 	{
 		String msg;
-		msg.printf(L"CreateProcess failed. Error: %lx\n%s", GetLastError(), exe.w_str());
+		msg.printf(L"CreateProcess failed. Error: %lx\n%s", GetLastError(),
+			runcmd.w_str());
 		throw Exception(msg);
 	}
 
-	Timer1->Interval = 5000; // give time for utorrent to show its window
+	Timer1->Interval = _startupDelay; // give time for utorrent to show its window
 	Timer1->Enabled = true;
 }
 
@@ -189,9 +141,25 @@ void __fastcall TFormMain::Timer1Timer(TObject *Sender)
 	if (_firstTimer)
 	{
 		_firstTimer = false;
-		Timer1->Interval = 1000;
+		Timer1->Interval = _pollInterval;
 	}
 
+	// track own child ut process
+	// when running multiple times by opening associated files
+	DWORD exitCode;
+	if (!GetExitCodeProcess(_hUtProcess, &exitCode))
+	{
+		String msg;
+		msg.printf(L"GetExitCodeProcess failed. Error: %lx", GetLastError());
+		throw Exception(msg);
+	}
+	if (exitCode != STILL_ACTIVE)
+	{
+		this->Close();
+		return;
+	}
+
+	// track ut window
 	_winFound = false;
 	EnumWindows(enumWindowCallback, NULL);
 	if (_winFound)
@@ -201,6 +169,7 @@ void __fastcall TFormMain::Timer1Timer(TObject *Sender)
 	}
 	else
 	{
+		// track any ut process
 		DWORD dwProcessID = FindExeProcess(_exeName);
 		if (dwProcessID)
 		{
@@ -210,6 +179,7 @@ void __fastcall TFormMain::Timer1Timer(TObject *Sender)
 		else
 		{
 			this->Close();
+			return;
 		}
 
 	}
@@ -253,24 +223,22 @@ void __fastcall TFormMain::TerminateUtorrentProcess1Click(TObject *Sender)
 void TFormMain::Save()
 {
 	CoInitialize(0);
-	String str1;
+
 	_di_IXMLDocument document = interface_cast<Xmlintf::IXMLDocument>
 		(new TXMLDocument(NULL));
 	document->Active = true;
 	document->SetEncoding(L"UTF-8");
 	document->Options = document->Options << doNodeAutoIndent;
-	_di_IXMLNode root = document->CreateNode(L"Root", ntElement, L"");
+	_di_IXMLNode root = document->CreateNode(L"Config", ntElement, L"");
 	document->DocumentElement = root;
 
-	_di_IXMLNode node1;
-	node1 = document->CreateNode(L"utorrent", ntElement, L"");
-	node1->Attributes[L"WindowTitle"] = _winTitle;
-	node1->Attributes[L"WindowClass"] = _winClass;
-	node1->Attributes[L"ExeName"] = _exeName;
-	root->ChildNodes->Add(node1);
+	root->Attributes[L"WindowTitle"] = _winTitle;
+	root->Attributes[L"WindowClass"] = _winClass;
+	root->Attributes[L"ExeName"] = _exeName;
+	root->Attributes[L"StartupDelayMs"] = _startupDelay;
+	root->Attributes[L"PollIntervalMs"] = _pollInterval;
 
-	str1.printf(L"%sutorrent-monitor.xml", tl_GetProgramPath().w_str());
-	document->SaveToFile(str1);
+	document->SaveToFile(_configFile);
 	document->Release();
 	CoUninitialize();
 }
@@ -279,38 +247,39 @@ void TFormMain::Save()
 void TFormMain::Load()
 {
 	CoInitialize(0);
-	String str1;
-	str1.printf(L"%sutorrent-monitor.xml", tl_GetProgramPath().w_str());
-	if (!FileExists(str1))
-		throw Exception(L"File utorrent-monitor.xml does not exist, aborting.");
+
+	if (!FileExists(_configFile))
+	{
+		Save();
+		return;
+	}
 
 	const _di_IXMLDocument document = interface_cast<Xmlintf::IXMLDocument>
 		(new TXMLDocument(NULL));
-	document->LoadFromFile(str1);
+	document->LoadFromFile(_configFile);
 
 	// find root node
-	const _di_IXMLNode root = document->ChildNodes->FindNode(L"Root");
+	const _di_IXMLNode root = document->ChildNodes->FindNode(L"Config");
 	if (root != NULL)
 	{
-		// traverse child nodes
-		for (int i = 0; i < root->ChildNodes->Count; i++)
+		// get attributes
+		if (root->HasAttribute(L"WindowTitle"))
+			_winTitle = root->Attributes[L"WindowTitle"];
+
+		if (root->HasAttribute(L"WindowClass"))
+			_winClass = root->Attributes[L"WindowClass"];
+
+		if (root->HasAttribute(L"ExeName"))
 		{
-			const _di_IXMLNode node = root->ChildNodes->Get(i);
-			// get attributes
-			if (node->HasAttribute(L"WindowTitle"))
-			{
-				_winTitle = node->Attributes[L"WindowTitle"];
-			}
-			if (node->HasAttribute(L"WindowClass"))
-			{
-				_winClass = node->Attributes[L"WindowClass"];
-			}
-			if (node->HasAttribute(L"ExeName"))
-			{
-				_exeName = node->Attributes[L"ExeName"];
-				_exeName = _exeName.LowerCase();
-			}
+			_exeName = root->Attributes[L"ExeName"];
+			_exeName = _exeName.LowerCase();
 		}
+
+		if (root->HasAttribute(L"StartupDelayMs"))
+			_startupDelay = (int)root->Attributes[L"StartupDelayMs"];
+
+		if (root->HasAttribute(L"PollIntervalMs"))
+			_pollInterval = (int)root->Attributes[L"PollIntervalMs"];
 	}
 	document->Release();
 	CoUninitialize();
