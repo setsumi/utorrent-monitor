@@ -138,25 +138,27 @@ __fastcall TFormMain::TFormMain(TComponent* Owner) : TForm(Owner)
 void __fastcall TFormMain::Timer1Timer(TObject *Sender)
 {
 	Timer1->Enabled = false;
+
+	// after startup delay
 	if (_firstTimer)
 	{
 		_firstTimer = false;
 		Timer1->Interval = _pollInterval;
-	}
 
-	// track own child ut process
-	// when running multiple times by opening associated files
-	DWORD exitCode;
-	if (!GetExitCodeProcess(_hUtProcess, &exitCode))
-	{
-		String msg;
-		msg.printf(L"GetExitCodeProcess failed. Error: %lx", GetLastError());
-		throw Exception(msg);
-	}
-	if (exitCode != STILL_ACTIVE)
-	{
-		this->Close();
-		return;
+		// track own child ut process
+		// when running multiple times by opening associated files
+		DWORD exitCode;
+		if (!GetExitCodeProcess(_hUtProcess, &exitCode))
+		{
+			String msg;
+			msg.printf(L"GetExitCodeProcess failed. Error: %lx", GetLastError());
+			throw Exception(msg);
+		}
+		if (exitCode != STILL_ACTIVE)
+		{
+			this->Close();
+			return;
+		}
 	}
 
 	// track ut window
@@ -199,6 +201,13 @@ void __fastcall TFormMain::TerminateUtorrentProcess1Click(TObject *Sender)
 	DWORD dwProcessID = FindExeProcess(_exeName);
 	if (dwProcessID)
 	{
+		// close own ut process handle just in case
+		if (_hUtProcess)
+		{
+			CloseHandle(_hUtProcess);
+			_hUtProcess = NULL;
+		}
+
 		DWORD dwDesiredAccess = PROCESS_TERMINATE;
 		BOOL bInheritHandle = FALSE;
 		HANDLE hProcess = OpenProcess(dwDesiredAccess, bInheritHandle, dwProcessID);
